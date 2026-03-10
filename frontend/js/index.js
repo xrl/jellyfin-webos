@@ -661,3 +661,83 @@ function stopDiscovery() {
 }
 
 startDiscovery();
+
+// When the TV suspends, the webOS compositor freezes the web-view surface.
+// On resume the stale surface sits on top of the video overlay, so the user
+// sees a frozen screenshot while audio keeps playing.  We listen for resume
+// signals and force the compositor to repaint.
+
+var hiddenTimestamp = null;
+var resumeDebounceTimer = null;
+var reloadThresholdMs = 30 * 60 * 1000;
+
+function nudgeCompositor() {
+    var contentFrame = document.querySelector('#contentFrame');
+    if (!contentFrame || contentFrame.style.display === 'none') {
+        return;
+    }
+
+    console.log('Nudging webOS compositor');
+
+    contentFrame.style.visibility = 'hidden';
+    void contentFrame.offsetHeight;
+
+    setTimeout(function () {
+        contentFrame.style.visibility = '';
+    }, 100);
+}
+
+function handleAppResume() {
+    if (resumeDebounceTimer) {
+        return;
+    }
+    resumeDebounceTimer = setTimeout(function () {
+        resumeDebounceTimer = null;
+    }, 500);
+
+    var contentFrame = document.querySelector('#contentFrame');
+    if (!contentFrame || contentFrame.style.display === 'none') {
+        return;
+    }
+
+    var elapsed = hiddenTimestamp ? (Date.now() - hiddenTimestamp) : 0;
+    hiddenTimestamp = null;
+
+    if (elapsed > reloadThresholdMs) {
+        console.log('App resumed after ' + Math.round(elapsed / 1000) + 's -- reloading iframe');
+        nudgeCompositor();
+        try {
+            contentFrame.contentWindow.location.reload();
+        } catch (e) {
+            contentFrame.contentWindow.location.href = contentFrame.contentWindow.location.href;
+        }
+    } else {
+        console.log('App resumed after ' + Math.round(elapsed / 1000) + 's -- nudging repaint');
+        nudgeCompositor();
+    }
+}
+
+document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+        hiddenTimestamp = Date.now();
+        console.log('App hidden (suspended)');
+    } else {
+        console.log('App visible (resumed via visibilitychange)');
+        handleAppResume();
+    }
+});
+
+// webOSRelaunch fires when a suspended app is re-opened from the launcher
+if (webOS.platform.tv) {
+    document.addEventListener('webOSRelaunch', function () {
+        console.log('App resumed via webOSRelaunch');
+        handleAppResume();
+    });
+}
+
+window.addEventListener('focus', function () {
+    if (hiddenTimestamp !== null) {
+        console.log('App resumed via focus event');
+        handleAppResume();
+    }
+});
