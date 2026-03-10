@@ -662,29 +662,15 @@ function stopDiscovery() {
 
 startDiscovery();
 
-/* App resume / visibility handling
- *
- * When the TV suspends (power button, screensaver, app switch) the webOS
- * compositor freezes the web-view surface.  The iframe DOM and its JS
- * keep running (audio from a <video> still plays), but the frozen surface
- * sits on top of the hardware video overlay like an opaque curtain --
- * so the user sees a stale screenshot while audio plays underneath.
- *
- * We listen for every signal webOS might give us on resume and force the
- * compositor to re-composite the surface.
- */
+// When the TV suspends, the webOS compositor freezes the web-view surface.
+// On resume the stale surface sits on top of the video overlay, so the user
+// sees a frozen screenshot while audio keeps playing.  We listen for resume
+// signals and force the compositor to repaint.
 
 var hiddenTimestamp = null;
+var resumeDebounceTimer = null;
+var reloadThresholdMs = 30 * 60 * 1000;
 
-// After 30 min the Jellyfin session / websocket is likely dead, so do a
-// full iframe reload instead of just a compositor nudge.
-var RELOAD_THRESHOLD_MS = 30 * 60 * 1000;
-
-// Force the webOS compositor to drop its stale surface capture and
-// repaint from the live DOM.  A simple display toggle at 0 ms is not
-// enough -- the compositor may coalesce the hide+show into a no-op.
-// We hide the iframe, force a synchronous layout flush, then restore
-// it after a real delay so the compositor sees two distinct frames.
 function nudgeCompositor() {
     var contentFrame = document.querySelector('#contentFrame');
     if (!contentFrame || contentFrame.style.display === 'none') {
@@ -693,20 +679,22 @@ function nudgeCompositor() {
 
     console.log('Nudging webOS compositor');
 
-    // 1. Hide the iframe
-    contentFrame.style.display = 'none';
-
-    // 2. Force a synchronous layout so the compositor processes the hide
+    contentFrame.style.visibility = 'hidden';
     void contentFrame.offsetHeight;
 
-    // 3. Restore after 100 ms -- long enough for the compositor to
-    //    discard its cached surface.
     setTimeout(function () {
-        contentFrame.style.display = '';
+        contentFrame.style.visibility = '';
     }, 100);
 }
 
 function handleAppResume() {
+    if (resumeDebounceTimer) {
+        return;
+    }
+    resumeDebounceTimer = setTimeout(function () {
+        resumeDebounceTimer = null;
+    }, 500);
+
     var contentFrame = document.querySelector('#contentFrame');
     if (!contentFrame || contentFrame.style.display === 'none') {
         return;
@@ -715,15 +703,13 @@ function handleAppResume() {
     var elapsed = hiddenTimestamp ? (Date.now() - hiddenTimestamp) : 0;
     hiddenTimestamp = null;
 
-    if (elapsed > RELOAD_THRESHOLD_MS) {
-        // Long suspend -- full reload to re-establish session + websocket.
-        // Nudge the compositor first so the reload visually takes effect.
+    if (elapsed > reloadThresholdMs) {
         console.log('App resumed after ' + Math.round(elapsed / 1000) + 's -- reloading iframe');
         nudgeCompositor();
         try {
             contentFrame.contentWindow.location.reload();
         } catch (e) {
-            contentFrame.src = contentFrame.src;
+            contentFrame.contentWindow.location.href = contentFrame.contentWindow.location.href;
         }
     } else {
         console.log('App resumed after ' + Math.round(elapsed / 1000) + 's -- nudging repaint');
@@ -731,8 +717,6 @@ function handleAppResume() {
     }
 }
 
-// Signal 1: visibilitychange -- the most common signal, but not always
-// fired on every webOS version when the TV powers off/on.
 document.addEventListener('visibilitychange', function () {
     if (document.hidden) {
         hiddenTimestamp = Date.now();
@@ -743,18 +727,14 @@ document.addEventListener('visibilitychange', function () {
     }
 });
 
-// Signal 2: webOSRelaunch -- fired when a suspended app is re-opened
-// from the launcher.  The SDK sets up a no-op stub; we replace it.
-if (window.Mojo) {
-    window.Mojo.relaunch = function () {
+// webOSRelaunch fires when a suspended app is re-opened from the launcher
+if (webOS.platform.tv) {
+    document.addEventListener('webOSRelaunch', function () {
         console.log('App resumed via webOSRelaunch');
         handleAppResume();
-    };
+    });
 }
 
-// Signal 3: focus -- some webOS versions only fire this on resume,
-// not visibilitychange.  Guard against double-nudge by checking
-// whether we were actually hidden.
 window.addEventListener('focus', function () {
     if (hiddenTimestamp !== null) {
         console.log('App resumed via focus event');
