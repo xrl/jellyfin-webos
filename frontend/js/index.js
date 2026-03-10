@@ -661,3 +661,76 @@ function stopDiscovery() {
 }
 
 startDiscovery();
+
+/* App resume / visibility handling
+ *
+ * When the TV is powered off (or the app is suspended) and later resumed,
+ * the iframe hosting jellyfin-web retains its stale DOM.  The webOS
+ * compositor may also stop repainting.  We handle two signals:
+ *
+ *  1. visibilitychange – fired when the app moves between foreground and
+ *     background (power button, app switch, screensaver, etc.)
+ *  2. webOSRelaunch – fired when a suspended app is re-launched from the
+ *     launcher instead of cold-started.
+ */
+
+var hiddenTimestamp = null;
+
+// Threshold (ms) after which we do a full iframe reload instead of a
+// lightweight repaint nudge.  30 minutes is long enough that the Jellyfin
+// session / websocket is likely dead.
+var RELOAD_THRESHOLD_MS = 30 * 60 * 1000;
+
+function handleAppResume() {
+    var contentFrame = document.querySelector('#contentFrame');
+    if (!contentFrame || contentFrame.style.display === 'none') {
+        // Not currently showing jellyfin-web – nothing to refresh
+        return;
+    }
+
+    var elapsed = hiddenTimestamp ? (Date.now() - hiddenTimestamp) : 0;
+    hiddenTimestamp = null;
+
+    if (elapsed > RELOAD_THRESHOLD_MS) {
+        // Long suspend – full reload so jellyfin-web re-establishes its
+        // session, websocket, and renders fresh content.
+        console.log('App resumed after ' + Math.round(elapsed / 1000) + 's – reloading iframe');
+        try {
+            contentFrame.contentWindow.location.reload();
+        } catch (e) {
+            // cross-origin or dead frame – force a src re-assign
+            contentFrame.src = contentFrame.src;
+        }
+    } else {
+        // Short suspend – nudge the compositor into repainting by briefly
+        // hiding and re-showing the iframe.  This forces webOS to
+        // re-composite the surface so the user sees current content rather
+        // than a stale screenshot.
+        console.log('App resumed after ' + Math.round(elapsed / 1000) + 's – nudging repaint');
+        contentFrame.style.display = 'none';
+        // Use a 0-ms timeout so the style change is flushed to the
+        // compositor before we flip it back.
+        setTimeout(function () {
+            contentFrame.style.display = '';
+        }, 0);
+    }
+}
+
+document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+        hiddenTimestamp = Date.now();
+        console.log('App hidden (suspended)');
+    } else {
+        console.log('App visible (resumed)');
+        handleAppResume();
+    }
+});
+
+// webOSRelaunch – fired instead of a fresh launch when the app is still in
+// memory.  The webOS SDK sets up a no-op stub; we replace it.
+if (window.Mojo) {
+    window.Mojo.relaunch = function () {
+        console.log('webOSRelaunch received');
+        handleAppResume();
+    };
+}
